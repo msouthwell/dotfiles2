@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+
+assignProxy(){
+    PROXY_ENV="http_proxy ftp_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY"
+    for envar in $PROXY_ENV
+    do
+        export $envar=$1
+    done
+    for envar in "no_proxy NO_PROXY"
+    do
+        export $envar=$2
+    done
+    
+    echo "Proxy set to $1"
+}
+
+proxydown(){
+    assignProxy "" # Unsets the proxy
+}
+
+proxyup(){
+    user=""
+    proxy_value="http://gatekeeper-w.mitre.org:80"
+    not_proxied_value="localhost,127.0.0.01,LocalAddress,LocalDomain.com,mitre.org,"$(printf '%s,' 192.168.0.{0..255})
+    assignProxy $proxy_value $not_proxied_value
+}
+
+#proxyup
+#proxydown
+
+
+# Create a new directory and enter it
+function mkd() {
+	mkdir -p "$@" && cd "$_";
+}
+
+function trash () { command mv "$@" ~/.Trash ; }     # trash:        Moves a file to the MacOS trash
+function ql () { qlmanage -p "$*" >& /dev/null; }    # ql:           Opens any file in MacOS Quicklook Preview
+
+#   extract:  Extract most know archives with one command
+#   ---------------------------------------------------------
+function extract () {
+        if [ -f $1 ] ; then
+          case $1 in
+            *.tar.bz2)   tar xjf $1     ;;
+            *.tar.gz)    tar xzf $1     ;;
+            *.bz2)       bunzip2 $1     ;;
+            *.rar)       unrar e $1     ;;
+            *.gz)        gunzip $1      ;;
+            *.tar)       tar xf $1      ;;
+            *.tbz2)      tar xjf $1     ;;
+            *.tgz)       tar xzf $1     ;;
+            *.zip)       unzip $1       ;;
+            *.Z)         uncompress $1  ;;
+            *.7z)        7z x $1        ;;
+            *)     echo "'$1' cannot be extracted via extract()" ;;
+             esac
+         else
+             echo "'$1' is not a valid file"
+         fi
+    }
+
+# Create a .tar.gz archive, using `zopfli`, `pigz` or `gzip` for compression
+function targz() {
+	local tmpFile="${@%/}.tar";
+	tar -cf "${tmpFile}" --exclude=".DS_Store" "${@}" || return 1;
+
+	size=$(
+		stat -f"%z" "${tmpFile}" 2> /dev/null; # macOS `stat`
+		stat -c"%s" "${tmpFile}" 2> /dev/null;  # GNU `stat`
+	);
+
+	local cmd="";
+	if (( size < 52428800 )) && hash zopfli 2> /dev/null; then
+		# the .tar file is smaller than 50 MB and Zopfli is available; use it
+		cmd="zopfli";
+	else
+		if hash pigz 2> /dev/null; then
+			cmd="pigz";
+		else
+			cmd="gzip";
+		fi;
+	fi;
+
+	echo "Compressing .tar ($((size / 1000)) kB) using \`${cmd}\`…";
+	"${cmd}" -v "${tmpFile}" || return 1;
+	[ -f "${tmpFile}" ] && rm "${tmpFile}";
+
+	zippedSize=$(
+		stat -f"%z" "${tmpFile}.gz" 2> /dev/null; # macOS `stat`
+		stat -c"%s" "${tmpFile}.gz" 2> /dev/null; # GNU `stat`
+	);
+
+	echo "${tmpFile}.gz ($((zippedSize / 1000)) kB) created successfully.";
+}
+
+# Determine size of a file or total size of a directory
+function fs() {
+	if du -b /dev/null > /dev/null 2>&1; then
+		local arg=-sbh;
+	else
+		local arg=-sh;
+	fi
+	if [[ -n "$@" ]]; then
+		du $arg -- "$@";
+	else
+		du $arg .[^.]* ./*;
+	fi;
+}
+
+# Use Git’s colored diff when available
+hash git &>/dev/null;
+if [ $? -eq 0 ]; then
+	function diff() {
+		git diff --no-index --color-words "$@";
+	}
+fi;
+
+
+# Start an HTTP server from a directory, optionally specifying the port
+function server() {
+	local port="${1:-8000}";
+	sleep 1 && open "http://localhost:${port}/" &
+	# Set the default Content-Type to `text/plain` instead of `application/octet-stream`
+	# And serve everything as UTF-8 (although not technically correct, this doesn’t break anything for binary files)
+	python -c $'import SimpleHTTPServer;\nmap = SimpleHTTPServer.SimpleHTTPRequestHandler.extensions_map;\nmap[""] = "text/plain";\nfor key, value in map.items():\n\tmap[key] = value + ";charset=UTF-8";\nSimpleHTTPServer.test();' "$port";
+}
+
+# Syntax-highlight JSON strings or files
+# Usage: `json '{"foo":42}'` or `echo '{"foo":42}' | json`
+function json() {
+	if [ -t 0 ]; then # argument
+		python -mjson.tool <<< "$*" | pygmentize -l javascript;
+	else # pipe
+		python -mjson.tool | pygmentize -l javascript;
+	fi;
+}
+
+# Show all the names (CNs and SANs) listed in the SSL certificate
+# for a given domain
+function getcertnames() {
+	if [ -z "${1}" ]; then
+		echo "ERROR: No domain specified.";
+		return 1;
+	fi;
+
+	local domain="${1}";
+	echo "Testing ${domain}…";
+	echo ""; # newline
+
+	local tmp=$(echo -e "GET / HTTP/1.0\nEOT" \
+		| openssl s_client -connect "${domain}:443" -servername "${domain}" 2>&1);
+
+	if [[ "${tmp}" = *"-----BEGIN CERTIFICATE-----"* ]]; then
+		local certText=$(echo "${tmp}" \
+			| openssl x509 -text -certopt "no_aux, no_header, no_issuer, no_pubkey, \
+			no_serial, no_sigdump, no_signame, no_validity, no_version");
+		echo "Common Name:";
+		echo ""; # newline
+		echo "${certText}" | grep "Subject:" | sed -e "s/^.*CN=//" | sed -e "s/\/emailAddress=.*//";
+		echo ""; # newline
+		echo "Subject Alternative Name(s):";
+		echo ""; # newline
+		echo "${certText}" | grep -A 1 "Subject Alternative Name:" \
+			| sed -e "2s/DNS://g" -e "s/ //g" | tr "," "\n" | tail -n +2;
+		return 0;
+	else
+		echo "ERROR: Certificate not found.";
+		return 1;
+	fi;
+}
+
+# `v` with no arguments opens the current directory in Vim, otherwise opens the
+# given location
+function v() {
+	if [ $# -eq 0 ]; then
+		vim .;
+	else
+		vim "$@";
+	fi;
+}
+
+# `tre` is a shorthand for `tree` with hidden files and color enabled, ignoring
+# the `.git` directory, listing directories first. The output gets piped into
+# `less` with options to preserve color and line numbers, unless the output is
+# small enough for one screen.
+function tre() {
+	tree -aC -I '.git|node_modules|bower_components' --dirsfirst "$@" | less -FRNX;
+}
+
+function gitpersonal() {
+    git config --global user.email "matt.g.southwell@gmail.com";
+    git config --global github.user "msouthwell";
+    echo "git email now matt.g.southwell@gmail.com";
+}
+
+function gitworking() {
+    git config --global user.email "msouthwell@mitre.com";
+    git config --global github.user "Southwell, Matthew G.";
+    echo "git user now set for mitre";
+}
+
+pyclean () {
+    find . -type f -name '*.py[co]' -delete -o -type d -name __pycache__ -delete
+}
